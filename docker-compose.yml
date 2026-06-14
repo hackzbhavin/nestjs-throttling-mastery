@@ -1,0 +1,88 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: throttle-redis
+    ports:
+      - '6379:6379'
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Redis Sentinel for HA demonstration
+  redis-sentinel:
+    image: redis:7-alpine
+    container_name: throttle-redis-sentinel
+    ports:
+      - '26379:26379'
+    command: >
+      sh -c "echo 'sentinel monitor mymaster redis 6379 1' > /tmp/sentinel.conf &&
+             echo 'sentinel down-after-milliseconds mymaster 5000' >> /tmp/sentinel.conf &&
+             echo 'sentinel failover-timeout mymaster 10000' >> /tmp/sentinel.conf &&
+             redis-sentinel /tmp/sentinel.conf"
+    depends_on:
+      - redis
+
+  mysql:
+    image: mysql:8
+    container_name: throttle-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: throttle_db
+    ports:
+      - '3306:3306'
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', 'localhost']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    container_name: throttle-backend-1
+    environment:
+      - NODE_COUNT=2
+      - THROTTLE_PEER_URLS=http://backend-2:3000
+    env_file: .env
+    ports:
+      - '3000:3000'
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+
+  backend-2:
+    build: ./backend
+    container_name: throttle-backend-2
+    environment:
+      - NODE_COUNT=2
+      - THROTTLE_PEER_URLS=http://backend:3000
+    env_file: .env
+    ports:
+      - '3001:3000'
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: throttle-prometheus
+    ports:
+      - '9090:9090'
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: throttle-grafana
+    ports:
+      - '3002:3000'
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
