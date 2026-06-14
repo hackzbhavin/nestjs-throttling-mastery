@@ -1,112 +1,104 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRedis } from '@nestjs-modules/ioredis';
-import { ConfigService } from '@nestjs/config';
 import Redis from 'ioredis';
 
 /**
- * @architecture Token Bucket via Lua atomic script.
+ * @architecture Token Bucket via Redis Lua Script
  *
- * Rationale:
- * - Lua script runs atomically in Redis — no race condition across 2 servers
- * - O(1) time/space per entity
- * - Uses Redis TIME command (server-side) to avoid client clock skew
- * - TTL auto-expires idle entity keys (no memory leak)
+ * Why Lua?
+ *   Redis executes Lua atomically — no race conditions between
+ *   read-modify-write on the same key from 2 NestJS servers.
  *
- * Shopify uses this exact pattern per app_id:shop_id pair.
+ * Token Bucket behaviour:
+ *   - Bucket starts full (GLOBAL_LIMIT tokens).
+ *   - Each request consumes `cost` tokens.
+ *   - Tokens refill at REFILL_RATE per second up to the cap.
+ *   - Allows bursting (unlike leaky bucket) — good for API workloads.
+ *
+ * Key format:  throttle:{entityId}
+ * TTL:         3600s — prevents orphan keys from inactive entities.
  */
 
-// Language: Lua
-// Keys[1] = throttle:entity_id
-// ARGV[1] = max_tokens, ARGV[2] = refill_rate (tokens/sec), ARGV[3] = ttl_seconds
-const TOKEN_BUCKET_SCRIPT = `
-local key = KEYS[1]
-local max_tokens = tonumber(ARGV[1])
-local refill_rate = tonumber(ARGV[2])
-local ttl = tonumber(ARGV[3])
-
--- Use Redis server time to avoid clock skew
-local now_arr = redis.call('TIME')
-local now_ms = tonumber(now_arr[1]) * 1000 + math.floor(tonumber(now_arr[2]) / 1000)
+const TOKEN_BUCKET_LUA = `
+local key        = KEYS[1]
+local limit      = tonumber(ARGV[1])
+local refillRate = tonumber(ARGV[2])  -- tokens per second
+local now        = tonumber(ARGV[3])  -- current time ms
+local cost       = tonumber(ARGV[4])  -- tokens to consume
 
 local data = redis.call('HMGET', key, 'tokens', 'last_refill')
-local tokens = tonumber(data[1]) or max_tokens
-local last_refill = tonumber(data[2]) or now_ms
+local tokens     = tonumber(data[1]) or limit
+local lastRefill = tonumber(data[2]) or now
 
--- Calculate tokens to add since last refill
-local elapsed_sec = (now_ms - last_refill) / 1000
-local add_tokens = math.floor(elapsed_sec * refill_rate)
-tokens = math.min(max_tokens, tokens + add_tokens)
-
-if add_tokens > 0 then
-  last_refill = now_ms
-end
+-- Refill: add tokens based on elapsed seconds
+local elapsed = math.max(0, (now - lastRefill) / 1000)
+tokens = math.min(limit, tokens + elapsed * refillRate)
 
 local allowed = 0
-if tokens >= 1 then
-  tokens = tokens - 1
+local remaining = math.floor(tokens)
+
+if tokens >= cost then
+  tokens = tokens - cost
+  remaining = math.floor(tokens)
   allowed = 1
 end
 
-redis.call('HSET', key, 'tokens', tokens, 'last_refill', last_refill)
-redis.call('EXPIRE', key, ttl)
+redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
+redis.call('EXPIRE', key, 3600)
 
--- Return: allowed(0/1), remaining_tokens, reset_timestamp_ms
-local reset_ms = last_refill + math.ceil((max_tokens - tokens) / refill_rate) * 1000
-return {allowed, tokens, reset_ms}
+return { allowed, remaining }
 `;
 
 @Injectable()
 export class TokenBucketStrategy {
   private readonly logger = new Logger(TokenBucketStrategy.name);
-  private scriptSha: string | null = null;
 
-  constructor(
-    @InjectRedis() private readonly redis: Redis,
-    private readonly config: ConfigService,
-  ) {}
+  private readonly GLOBAL_LIMIT: number;
+  private readonly REFILL_RATE:  number;
 
-  /**
-   * Load Lua script using SCRIPT LOAD for efficiency (only send hash after first load)
-   */
-  private async getScriptSha(): Promise<string> {
-    if (!this.scriptSha) {
-      this.scriptSha = await this.redis.script('LOAD', TOKEN_BUCKET_SCRIPT) as string;
-      this.logger.log(`Token bucket Lua script loaded: sha=${this.scriptSha}`);
-    }
-    return this.scriptSha;
+  constructor(@InjectRedis() private readonly redis: Redis) {
+    this.GLOBAL_LIMIT = parseInt(process.env.THROTTLE_GLOBAL_LIMIT ?? '100', 10);
+    this.REFILL_RATE  = parseFloat(process.env.THROTTLE_REFILL_RATE  ?? '10');  // tokens/sec
   }
 
-  async consume(entityId: string): Promise<{ allowed: boolean; remaining: number; resetAt: number }> {
-    const maxTokens = this.config.get<number>('THROTTLE_GLOBAL_LIMIT', 100);
-    const refillRate = this.config.get<number>('THROTTLE_REFILL_RATE', 10);
-    const ttl = 3600; // 1 hour — prevents key memory leak
-
+  async consume(
+    entityId: string,
+    cost = 1,
+  ): Promise<{ allowed: boolean; remaining: number; resetAt: number }> {
     const key = `throttle:${entityId}`;
+    const now = Date.now();
 
-    try {
-      const sha = await this.getScriptSha();
-      const result = await this.redis.evalsha(
-        sha, 1, key,
-        String(maxTokens), String(refillRate), String(ttl)
-      ) as [number, number, number];
+    const [allowed, remaining] = await this.redis.eval(
+      TOKEN_BUCKET_LUA, 1, key,
+      this.GLOBAL_LIMIT,
+      this.REFILL_RATE,
+      now,
+      cost,
+    ) as [number, number];
 
-      return {
-        allowed: result[0] === 1,
-        remaining: result[1],
-        resetAt: result[2],
-      };
-    } catch (err: any) {
-      // NOSCRIPT error means Redis flushed scripts — reload and retry once
-      if (err.message?.includes('NOSCRIPT')) {
-        this.scriptSha = null;
-        const sha = await this.getScriptSha();
-        const result = await this.redis.evalsha(
-          sha, 1, key,
-          String(maxTokens), String(refillRate), String(ttl)
-        ) as [number, number, number];
-        return { allowed: result[0] === 1, remaining: result[1], resetAt: result[2] };
-      }
-      throw err;
+    // resetAt = time until bucket is full again
+    const tokensNeeded = this.GLOBAL_LIMIT - remaining;
+    const resetAt = now + Math.ceil(tokensNeeded / this.REFILL_RATE) * 1000;
+
+    return { allowed: allowed === 1, remaining, resetAt };
+  }
+
+  async ping(): Promise<void> {
+    await this.redis.ping();
+  }
+
+  // Called on Redis recovery — seed from local snapshot to avoid thundering herd
+  async seedFromSnapshot(
+    snapshot: Record<string, number>,
+    limit: number,
+  ): Promise<void> {
+    const pipeline = this.redis.pipeline();
+    const now = Date.now();
+    for (const [entityId, tokens] of Object.entries(snapshot)) {
+      const key = `throttle:${entityId}`;
+      pipeline.hmset(key, 'tokens', tokens, 'last_refill', now);
+      pipeline.expire(key, 3600);
     }
+    await pipeline.exec();
   }
 }

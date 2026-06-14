@@ -1,91 +1,102 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { LocalBucketFallback } from './local-bucket.fallback';
 import { ThrottleEntity } from '../entities/throttle-fallback.entity';
-import { ConfigService } from '@nestjs/config';
 
 /**
- * @architecture MySQL Persistence — Extended Outage Fallback.
+ * @architecture MySQL Flush — Durable fallback for extended Redis outages.
  *
- * When Redis is down for minutes+ (not just seconds),
- * local in-memory state is lost on server restart.
- * This service:
- *   1. Flushes local counter snapshots to MySQL every 5s
- *   2. Seeds local counters from MySQL on startup (if Redis still down)
+ * Activated ONLY when ThrottleMode = LOCAL (Redis + peer both unreachable).
+ * Writes local counter state to MySQL every 5s.
  *
- * Rationale: MySQL is slower but durable. Use only as last resort.
- * This is the "Shopify offline mode" — degraded but correct.
+ * On server restart during outage: seeds local buckets from MySQL
+ * so counters survive restarts — prevents quota reset on server bounce.
+ *
+ * This is Strategy 4 from the outage decision tree:
+ *   outage > 5min → MySQL flush active
+ *
+ * @rationale
+ *   MySQL is slower than Redis but durable.
+ *   5s batch interval balances durability vs. query load.
+ *   We never query MySQL on the hot path — only in background flush.
  */
 @Injectable()
-export class MySQLFlushService implements OnModuleInit {
-  private readonly logger = new Logger(MySQLFlushService.name);
-  private readonly FLUSH_INTERVAL_MS = 5000;
+export class MySQLFlushService implements OnModuleDestroy {
+  private readonly logger    = new Logger(MySQLFlushService.name);
+  private          timer: NodeJS.Timeout | null = null;
+  private readonly FLUSH_INTERVAL_MS = 5_000;
 
   constructor(
+    private readonly localBucket: LocalBucketFallback,
     @InjectRepository(ThrottleEntity)
     private readonly repo: Repository<ThrottleEntity>,
-    private readonly localBucket: LocalBucketFallback,
-    private readonly config: ConfigService,
   ) {}
 
-  async onModuleInit() {
-    await this.seedFromMySQL();
-    setInterval(() => this.flushToMySQL(), this.FLUSH_INTERVAL_MS);
+  startFlush(): void {
+    if (this.timer) return; // already running
+    this.logger.warn('MySQLFlushService: starting periodic flush (Redis+Peer both down)');
+    this.timer = setInterval(() => this.flush(), this.FLUSH_INTERVAL_MS);
   }
 
-  private getWindowStart(): Date {
-    const windowMs = this.config.get<number>('THROTTLE_WINDOW_MS', 60000);
-    const now = Date.now();
-    return new Date(Math.floor(now / windowMs) * windowMs);
-  }
-
-  async flushToMySQL(): Promise<void> {
-    const snapshot = this.localBucket.getSnapshot();
-    const entries = Object.entries(snapshot);
-    if (!entries.length) return;
-
-    const windowStart = this.getWindowStart();
-    const globalLimit = this.config.get<number>('THROTTLE_GLOBAL_LIMIT', 100);
-
-    try {
-      // Upsert all entities in one query
-      const values = entries.map(([entityId, tokens]) => ({
-        entityId,
-        usedTokens: Math.max(0, globalLimit - tokens),
-        windowStart,
-      }));
-
-      await this.repo
-        .createQueryBuilder()
-        .insert()
-        .into(ThrottleEntity)
-        .values(values)
-        .orUpdate(['used_tokens', 'updated_at'], ['entity_id', 'window_start'])
-        .execute();
-    } catch (err) {
-      this.logger.error('MySQL flush failed', err);
-    }
+  stopFlush(): void {
+    if (!this.timer) return;
+    clearInterval(this.timer);
+    this.timer = null;
+    this.logger.log('MySQLFlushService: stopped (primary store recovered)');
   }
 
   async seedFromMySQL(): Promise<void> {
     const windowStart = this.getWindowStart();
-    const globalLimit = this.config.get<number>('THROTTLE_GLOBAL_LIMIT', 100);
+    const rows = await this.repo
+      .createQueryBuilder('t')
+      .where('t.windowStart = :windowStart', { windowStart })
+      .andWhere('t.updatedAt > NOW() - INTERVAL 2 MINUTE')
+      .getMany();
+
+    for (const row of rows) {
+      const globalLimit = parseInt(process.env.THROTTLE_GLOBAL_LIMIT ?? '100', 10);
+      const nodeCount   = parseInt(process.env.THROTTLE_NODE_COUNT   ?? '2',   10);
+      const nodeLimit   = Math.floor(globalLimit / nodeCount);
+      const remaining   = Math.max(0, nodeLimit - row.usedTokens);
+      this.localBucket.consume(row.entityId, 0, remaining); // seed by consuming 0
+    }
+
+    this.logger.log(`Seeded ${rows.length} entities from MySQL on startup`);
+  }
+
+  onModuleDestroy(): void {
+    this.stopFlush();
+  }
+
+  private async flush(): Promise<void> {
+    const snapshot     = this.localBucket.getSnapshot();
+    const windowStart  = this.getWindowStart();
+    const globalLimit  = parseInt(process.env.THROTTLE_GLOBAL_LIMIT ?? '100', 10);
+    const nodeCount    = parseInt(process.env.THROTTLE_NODE_COUNT   ?? '2',   10);
+    const nodeLimit    = Math.floor(globalLimit / nodeCount);
+    const entities     = Object.entries(snapshot);
+
+    if (!entities.length) return;
 
     try {
-      const rows = await this.repo.find({ where: { windowStart } });
-      if (!rows.length) return;
-
-      this.logger.log(`Seeding ${rows.length} entity counters from MySQL`);
-
-      // Reconstruct local buckets from MySQL state
-      const snapshot: Record<string, number> = {};
-      rows.forEach(row => {
-        snapshot[row.entityId] = Math.max(0, globalLimit - row.usedTokens);
-      });
-      this.localBucket.mergePeerSnapshot(snapshot);
+      // Upsert in batch
+      for (const [entityId, tokens] of entities) {
+        const usedTokens = Math.max(0, nodeLimit - Math.floor(tokens));
+        await this.repo.upsert(
+          { entityId, usedTokens, windowStart },
+          ['entityId', 'windowStart'],
+        );
+      }
+      this.logger.debug(`MySQL flush: ${entities.length} entities written`);
     } catch (err) {
-      this.logger.error('MySQL seed failed', err);
+      this.logger.error(`MySQL flush failed: ${(err as Error).message}`);
     }
+  }
+
+  private getWindowStart(): string {
+    const d = new Date();
+    d.setSeconds(0, 0);
+    return d.toISOString();
   }
 }

@@ -1,74 +1,72 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { InjectRedis } from '@nestjs-modules/ioredis';
-import Redis from 'ioredis';
+import { Injectable, Logger } from '@nestjs/common';
 
 export enum CircuitState {
-  CLOSED = 'closed',   // Normal: Redis OK, pass through
-  OPEN = 'open',       // Tripped: Redis down, use fallback
-  HALF_OPEN = 'half_open', // Recovery probe: test one request
+  CLOSED   = 'CLOSED',   // healthy — requests pass through
+  OPEN     = 'OPEN',     // unhealthy — requests blocked, use fallback
+  HALF_OPEN = 'HALF_OPEN', // recovery probe — 1 request allowed through
 }
 
 /**
- * @architecture Circuit Breaker for Redis health.
+ * @architecture Circuit Breaker for Redis health detection.
  *
- * State Machine:
- *   CLOSED ─(N failures)─► OPEN ─(timeout)─► HALF_OPEN ─(success)─► CLOSED
- *                                                          └(failure)─► OPEN
+ * States:
+ *   CLOSED    → healthy, all requests go to Redis.
+ *   OPEN      → tripped (≥3 failures), route to fallback immediately.
+ *   HALF_OPEN → after RESET_TIMEOUT, allow 1 probe request.
+ *               On success → CLOSED. On failure → OPEN again.
  *
- * Rationale: Without this, every request waits for Redis timeout (5s default)
- * when Redis is down. Circuit opens fast (3 failures) and probes recovery (15s).
- * This is the Uber AIMD pattern — cut fast, recover linearly.
+ * This prevents thundering herd on a recovering Redis:
+ * without it, all servers hammer Redis the moment it comes back.
+ *
+ * Thresholds (tunable via env):
+ *   FAILURE_THRESHOLD  = 3   — failures before trip
+ *   RESET_TIMEOUT_MS   = 10s — OPEN → HALF_OPEN wait
  */
 @Injectable()
-export class CircuitBreakerService implements OnModuleInit {
+export class CircuitBreakerService {
   private readonly logger = new Logger(CircuitBreakerService.name);
-  public state: CircuitState = CircuitState.CLOSED;
-  private failureCount = 0;
-  private lastOpenedAt: number | null = null;
 
-  private get FAILURE_THRESHOLD() {
-    return this.config.get<number>('THROTTLE_CIRCUIT_FAILURE_THRESHOLD', 3);
-  }
+  private _state:          CircuitState = CircuitState.CLOSED;
+  private failureCount:    number       = 0;
+  private lastFailureTime: number       = 0;
 
-  private get RECOVERY_PROBE_MS() {
-    return this.config.get<number>('THROTTLE_CIRCUIT_RECOVERY_PROBE_MS', 15000);
-  }
+  private readonly FAILURE_THRESHOLD = parseInt(process.env.CB_FAILURE_THRESHOLD ?? '3',     10);
+  private readonly RESET_TIMEOUT_MS  = parseInt(process.env.CB_RESET_TIMEOUT_MS  ?? '10000', 10);
 
-  constructor(
-    @InjectRedis() private readonly redis: Redis,
-    private readonly config: ConfigService,
-  ) {}
-
-  onModuleInit() {
-    // Periodic check every 15s to attempt recovery from OPEN state
-    setInterval(() => this.maybeTransitionToHalfOpen(), this.RECOVERY_PROBE_MS);
+  get state(): CircuitState {
+    if (
+      this._state === CircuitState.OPEN &&
+      Date.now() - this.lastFailureTime >= this.RESET_TIMEOUT_MS
+    ) {
+      this._state = CircuitState.HALF_OPEN;
+      this.logger.log('Circuit → HALF_OPEN (probing Redis)');
+    }
+    return this._state;
   }
 
   recordSuccess(): void {
-    this.failureCount = 0;
-    if (this.state === CircuitState.HALF_OPEN) {
-      this.logger.log('Circuit Breaker: HALF_OPEN → CLOSED (Redis recovered)');
-      this.state = CircuitState.CLOSED;
+    if (this._state !== CircuitState.CLOSED) {
+      this.logger.log('Circuit → CLOSED (Redis healthy)');
     }
+    this.failureCount    = 0;
+    this.lastFailureTime = 0;
+    this._state          = CircuitState.CLOSED;
   }
 
   recordFailure(): void {
     this.failureCount++;
-    if (this.failureCount >= this.FAILURE_THRESHOLD && this.state === CircuitState.CLOSED) {
-      this.state = CircuitState.OPEN;
-      this.lastOpenedAt = Date.now();
-      this.logger.error(`Circuit Breaker: CLOSED → OPEN after ${this.failureCount} failures`);
+    this.lastFailureTime = Date.now();
+    if (this.failureCount >= this.FAILURE_THRESHOLD) {
+      if (this._state !== CircuitState.OPEN) {
+        this.logger.warn(`Circuit → OPEN (${this.failureCount} failures)`);
+      }
+      this._state = CircuitState.OPEN;
     }
   }
 
-  private maybeTransitionToHalfOpen(): void {
-    if (this.state === CircuitState.OPEN && this.lastOpenedAt) {
-      const elapsed = Date.now() - this.lastOpenedAt;
-      if (elapsed >= this.RECOVERY_PROBE_MS) {
-        this.state = CircuitState.HALF_OPEN;
-        this.logger.log('Circuit Breaker: OPEN → HALF_OPEN (probing Redis)');
-      }
-    }
+  reset(): void {
+    this.failureCount    = 0;
+    this.lastFailureTime = 0;
+    this._state          = CircuitState.CLOSED;
   }
 }
